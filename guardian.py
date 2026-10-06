@@ -86,7 +86,7 @@ def database_snapshot():
                 SELECT
                     NOW(),
                     COUNT(*),
-                    MAX(opportunity_time)
+                    MAX(created_at)
                 FROM public.signals2_opportunities
                 """
             )
