@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BRAD'S SIGNALS GUARDIAN
-G1.4 - Telegram safety alerts
+G1.5 - Worker heartbeat and service-health monitoring
 
 Observer/safety-alert service:
 - PostgreSQL SELECTs only; session forced read-only.
@@ -20,6 +20,9 @@ Alerts:
 - Persistent same warning: reminder only after cooldown
 - Changed warning set: immediate updated alert
 
+G1.5 additionally observes Bot 2.0 scanner, hourly-memory and outcome-worker
+heartbeats through the existing read-only Redis health hash.
+
 Guardian never sends trading signals and never changes Bot 2.0.
 """
 
@@ -32,7 +35,7 @@ import redis
 import requests
 
 
-GUARDIAN_VERSION = "G1.4-TELEGRAM-SAFETY-ALERTS"
+GUARDIAN_VERSION = "G1.5-WORKER-HEARTBEAT-SERVICE-HEALTH"
 
 DATABASE_WRITES = False
 REDIS_WRITES = False
@@ -56,6 +59,18 @@ SCANNER_SLOW_SECONDS = float(
 )
 ALERT_COOLDOWN_SECONDS = int(
     os.environ.get("GUARDIAN_ALERT_COOLDOWN_SECONDS", "1800")
+)
+MEMORY_STALE_SECONDS = int(
+    os.environ.get("GUARDIAN_MEMORY_STALE_SECONDS", "5400")
+)
+OUTCOME_WORKER_START_GRACE_SECONDS = int(
+    os.environ.get("GUARDIAN_OUTCOME_WORKER_START_GRACE_SECONDS", "5400")
+)
+OUTCOME_WORKER_STALE_SECONDS = int(
+    os.environ.get("GUARDIAN_OUTCOME_WORKER_STALE_SECONDS", "5400")
+)
+OUTCOME_WORKER_FAILURE_LIMIT = int(
+    os.environ.get("GUARDIAN_OUTCOME_WORKER_FAILURE_LIMIT", "2")
 )
 
 EXPECTED_SCANNER_LOCK_MAX_TTL = 240
@@ -371,6 +386,19 @@ def print_banner():
     print(f"SCANNER STALE LIMIT: {SCANNER_STALE_SECONDS}s", flush=True)
     print(f"OPPORTUNITY STALE LIMIT: {OPPORTUNITY_STALE_SECONDS}s", flush=True)
     print(f"SCANNER SLOW LIMIT: {SCANNER_SLOW_SECONDS:.0f}s", flush=True)
+    print(f"MEMORY STALE LIMIT: {MEMORY_STALE_SECONDS}s", flush=True)
+    print(
+        f"OUTCOME WORKER START GRACE: {OUTCOME_WORKER_START_GRACE_SECONDS}s",
+        flush=True,
+    )
+    print(
+        f"OUTCOME WORKER STALE LIMIT: {OUTCOME_WORKER_STALE_SECONDS}s",
+        flush=True,
+    )
+    print(
+        f"OUTCOME WORKER FAILURE LIMIT: {OUTCOME_WORKER_FAILURE_LIMIT}",
+        flush=True,
+    )
     print(f"ALERT COOLDOWN: {ALERT_COOLDOWN_SECONDS}s", flush=True)
     print("SAFETY CHECK: PASS", flush=True)
 
@@ -533,6 +561,144 @@ def run_cycle(cycle):
 
             if last_error not in (None, "", "None"):
                 print(f"BOT LAST ERROR OBSERVED: {last_error}", flush=True)
+
+            # G1.5 worker/service health. These fields are written by Bot 2.0
+            # into the existing signals2:health hash. Guardian remains read-only.
+            memory_time = health.get("last_memory_cycle")
+            memory_age = seconds_old(memory_time, now)
+            memory_failures = safe_int(
+                health.get("memory_failures_consecutive"), 0
+            )
+            memory_duration = safe_float(
+                health.get("last_memory_duration_seconds")
+            )
+
+            if memory_time in (None, "", "None"):
+                print(
+                    "MEMORY WORKER: STARTUP/WAITING | "
+                    "no completed memory cycle recorded yet",
+                    flush=True,
+                )
+            else:
+                memory_status = (
+                    "HEALTHY"
+                    if memory_age is not None and memory_age <= MEMORY_STALE_SECONDS
+                    else "STALE"
+                )
+                print(
+                    "MEMORY WORKER: "
+                    f"status={memory_status} | last_cycle={memory_time} | "
+                    f"age={None if memory_age is None else round(memory_age, 1)}s | "
+                    f"duration={memory_duration}s | failures={memory_failures}",
+                    flush=True,
+                )
+                if memory_age is None:
+                    add_warning(
+                        warnings,
+                        "MEMORY_HEARTBEAT_INVALID",
+                        "last_memory_cycle is invalid",
+                    )
+                elif memory_age > MEMORY_STALE_SECONDS:
+                    add_warning(
+                        warnings,
+                        "MEMORY_HEARTBEAT_STALE",
+                        f"last memory cycle is {memory_age:.0f}s old",
+                    )
+
+            if memory_failures >= 2:
+                add_warning(
+                    warnings,
+                    "MEMORY_REPEATED_FAILURES",
+                    f"Bot reports {memory_failures} consecutive memory failures",
+                )
+
+            outcome_started = health.get("outcome_worker_started")
+            outcome_started_age = seconds_old(outcome_started, now)
+            outcome_cycle = health.get("last_outcome_cycle")
+            outcome_cycle_age = seconds_old(outcome_cycle, now)
+            outcome_success = health.get("last_outcome_success")
+            outcome_success_age = seconds_old(outcome_success, now)
+            outcome_duration = safe_float(
+                health.get("last_outcome_duration_seconds")
+            )
+            outcome_error = health.get("last_outcome_error")
+            outcome_failures = safe_int(
+                health.get("outcome_failures_consecutive"), 0
+            )
+
+            if outcome_started in (None, "", "None"):
+                add_warning(
+                    warnings,
+                    "OUTCOME_WORKER_NOT_STARTED",
+                    "Bot health has no outcome_worker_started timestamp",
+                )
+                print(
+                    "OUTCOME WORKER: WARNING | start heartbeat missing",
+                    flush=True,
+                )
+            elif outcome_cycle in (None, "", "None"):
+                if (
+                    outcome_started_age is not None
+                    and outcome_started_age > OUTCOME_WORKER_START_GRACE_SECONDS
+                ):
+                    add_warning(
+                        warnings,
+                        "OUTCOME_WORKER_FIRST_CYCLE_OVERDUE",
+                        "worker started "
+                        f"{outcome_started_age:.0f}s ago but no cycle has started",
+                    )
+                    outcome_status = "OVERDUE"
+                else:
+                    outcome_status = "STARTUP/WAITING"
+                print(
+                    "OUTCOME WORKER: "
+                    f"status={outcome_status} | started={outcome_started} | "
+                    f"started_age={None if outcome_started_age is None else round(outcome_started_age, 1)}s | "
+                    "last_cycle=None | last_success=None | "
+                    f"failures={outcome_failures} | last_error={outcome_error}",
+                    flush=True,
+                )
+            else:
+                outcome_status = "HEALTHY"
+                if outcome_cycle_age is None:
+                    outcome_status = "INVALID"
+                    add_warning(
+                        warnings,
+                        "OUTCOME_WORKER_HEARTBEAT_INVALID",
+                        "last_outcome_cycle is invalid",
+                    )
+                elif outcome_cycle_age > OUTCOME_WORKER_STALE_SECONDS:
+                    outcome_status = "STALE"
+                    add_warning(
+                        warnings,
+                        "OUTCOME_WORKER_HEARTBEAT_STALE",
+                        f"last outcome cycle is {outcome_cycle_age:.0f}s old",
+                    )
+
+                print(
+                    "OUTCOME WORKER: "
+                    f"status={outcome_status} | started={outcome_started} | "
+                    f"last_cycle={outcome_cycle} | "
+                    f"cycle_age={None if outcome_cycle_age is None else round(outcome_cycle_age, 1)}s | "
+                    f"last_success={outcome_success} | "
+                    f"success_age={None if outcome_success_age is None else round(outcome_success_age, 1)}s | "
+                    f"duration={outcome_duration}s | failures={outcome_failures} | "
+                    f"last_error={outcome_error}",
+                    flush=True,
+                )
+
+            if outcome_failures >= OUTCOME_WORKER_FAILURE_LIMIT:
+                add_warning(
+                    warnings,
+                    "OUTCOME_WORKER_REPEATED_FAILURES",
+                    f"Bot reports {outcome_failures} consecutive outcome-worker failures",
+                )
+
+            if outcome_error not in (None, "", "None"):
+                print(
+                    f"OUTCOME WORKER LAST ERROR OBSERVED: {outcome_error}",
+                    flush=True,
+                )
 
         if not watchdog:
             add_warning(
