@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
 """
 BRAD'S SIGNALS GUARDIAN
-G1.0 - Observer-only safety foundation
+G1.1 - Bot activity monitor
 
-Purpose:
-- Run as a completely separate Railway service.
-- Observe shared PostgreSQL and Redis health.
-- Never place trades.
-- Never send signals.
-- Never modify Bot 2.0.
-- Never write to PostgreSQL or Redis in G1.0.
+Observer-only:
+- PostgreSQL SELECTs only, session forced read-only.
+- Redis PING only.
+- No Telegram.
+- No trades.
+- No production modification.
+- No emergency pause.
 
-Later Guardian stages can add:
-- scanner freshness monitoring
-- database/Redis outage detection
-- duplicate/stuck-process detection
-- AI behaviour anomaly detection
-- confidence/distribution drift detection
-- Telegram alerts
-- protected emergency pause
-
-Those later actions are NOT enabled here.
+G1.1 adds:
+- latest opportunity timestamp monitoring
+- database activity/freshness monitoring
+- stale-data detection
+- opportunity flow monitoring between Guardian cycles
 """
 
 import os
@@ -30,7 +25,7 @@ from datetime import datetime, timezone
 import psycopg2
 import redis
 
-GUARDIAN_VERSION = "G1.0-OBSERVER-ONLY-FOUNDATION"
+GUARDIAN_VERSION = "G1.1-BOT-ACTIVITY-MONITOR"
 
 DATABASE_WRITES = False
 REDIS_WRITES = False
@@ -39,9 +34,19 @@ TRADE_EXECUTION = False
 PRODUCTION_MODIFICATION = False
 EMERGENCY_PAUSE = False
 
-CHECK_INTERVAL_SECONDS = int(os.environ.get("GUARDIAN_CHECK_INTERVAL_SECONDS", "60"))
+CHECK_INTERVAL_SECONDS = int(
+    os.environ.get("GUARDIAN_CHECK_INTERVAL_SECONDS", "60")
+)
+
+# Bot 2.0 normally works on a 5-minute scanner cycle.
+# 15 minutes gives three expected cycles before Guardian calls activity stale.
+OPPORTUNITY_STALE_SECONDS = int(
+    os.environ.get("GUARDIAN_OPPORTUNITY_STALE_SECONDS", "900")
+)
 
 SEP = "=" * 100
+
+_previous_opportunity_count = None
 
 
 def section(title):
@@ -54,10 +59,21 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
-def database_health():
+def seconds_old(value, now):
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return max(0.0, (now - value).total_seconds())
+
+
+def database_snapshot():
     url = os.environ.get("SIGNALS2_DATABASE_URL") or os.environ.get("DATABASE_URL")
     if not url:
-        return False, "DATABASE URL NOT CONFIGURED"
+        return {
+            "ok": False,
+            "message": "DATABASE URL NOT CONFIGURED",
+        }
 
     conn = None
     try:
@@ -65,14 +81,32 @@ def database_health():
         conn.set_session(readonly=True, autocommit=False)
 
         with conn.cursor() as cur:
-            cur.execute("SELECT NOW(), COUNT(*) FROM public.signals2_opportunities")
-            db_time, opportunity_count = cur.fetchone()
+            cur.execute(
+                """
+                SELECT
+                    NOW(),
+                    COUNT(*),
+                    MAX(opportunity_time)
+                FROM public.signals2_opportunities
+                """
+            )
+            db_time, opportunity_count, latest_opportunity_time = cur.fetchone()
 
         conn.rollback()
-        return True, f"READY | READ ONLY | opportunities={opportunity_count} | db_time={db_time}"
+
+        return {
+            "ok": True,
+            "message": "READY | READ ONLY",
+            "db_time": db_time,
+            "opportunity_count": int(opportunity_count),
+            "latest_opportunity_time": latest_opportunity_time,
+        }
 
     except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
+        return {
+            "ok": False,
+            "message": f"{type(exc).__name__}: {exc}",
+        }
 
     finally:
         if conn is not None:
@@ -128,22 +162,104 @@ def print_banner():
     print(f"PRODUCTION MODIFICATION: {PRODUCTION_MODIFICATION}", flush=True)
     print(f"EMERGENCY PAUSE: {EMERGENCY_PAUSE}", flush=True)
     print(f"CHECK INTERVAL: {CHECK_INTERVAL_SECONDS}s", flush=True)
+    print(f"OPPORTUNITY STALE LIMIT: {OPPORTUNITY_STALE_SECONDS}s", flush=True)
     print("SAFETY CHECK: PASS", flush=True)
 
 
 def run_cycle(cycle):
-    started = time.monotonic()
+    global _previous_opportunity_count
 
-    db_ok, db_message = database_health()
+    started = time.monotonic()
+    now = utc_now()
+
+    db = database_snapshot()
     redis_ok, redis_message = redis_health()
 
-    overall = "HEALTHY" if db_ok and redis_ok else "WARNING"
+    warnings = []
 
     section(f"GUARDIAN CYCLE {cycle}")
-    print(f"UTC: {utc_now().isoformat()}", flush=True)
-    print(f"POSTGRES: {'HEALTHY' if db_ok else 'WARNING'} | {db_message}", flush=True)
-    print(f"REDIS: {'HEALTHY' if redis_ok else 'WARNING'} | {redis_message}", flush=True)
-    print(f"GUARDIAN STATUS: {overall}", flush=True)
+    print(f"UTC: {now.isoformat()}", flush=True)
+
+    if db["ok"]:
+        count = db["opportunity_count"]
+        latest = db["latest_opportunity_time"]
+        age = seconds_old(latest, now)
+
+        print(
+            f"POSTGRES: HEALTHY | {db['message']} | opportunities={count}",
+            flush=True,
+        )
+
+        if latest is None:
+            warnings.append("NO OPPORTUNITIES FOUND")
+            print("BOT ACTIVITY: WARNING | no opportunity timestamp found", flush=True)
+        else:
+            freshness = (
+                "HEALTHY"
+                if age <= OPPORTUNITY_STALE_SECONDS
+                else "STALE"
+            )
+
+            print(
+                "LATEST OPPORTUNITY: "
+                f"{latest} | age={age:.0f}s | status={freshness}",
+                flush=True,
+            )
+
+            if freshness == "STALE":
+                warnings.append(
+                    f"OPPORTUNITY DATA STALE ({age:.0f}s old)"
+                )
+
+        if _previous_opportunity_count is None:
+            print(
+                "OPPORTUNITY FLOW: BASELINE CAPTURED "
+                f"| count={count}",
+                flush=True,
+            )
+        else:
+            delta = count - _previous_opportunity_count
+
+            if delta < 0:
+                warnings.append("OPPORTUNITY COUNT MOVED BACKWARDS")
+                print(
+                    f"OPPORTUNITY FLOW: WARNING | delta={delta}",
+                    flush=True,
+                )
+            elif delta == 0:
+                print(
+                    "OPPORTUNITY FLOW: NO NEW ROWS THIS GUARDIAN CYCLE "
+                    "| not automatically an error",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"OPPORTUNITY FLOW: ACTIVE | +{delta} rows since prior check",
+                    flush=True,
+                )
+
+        _previous_opportunity_count = count
+
+    else:
+        warnings.append("POSTGRES UNAVAILABLE")
+        print(f"POSTGRES: WARNING | {db['message']}", flush=True)
+
+    if redis_ok:
+        print(f"REDIS: HEALTHY | {redis_message}", flush=True)
+    else:
+        warnings.append("REDIS UNAVAILABLE")
+        print(f"REDIS: WARNING | {redis_message}", flush=True)
+
+    if warnings:
+        overall = "WARNING"
+        print(f"GUARDIAN STATUS: {overall}", flush=True)
+        print("GUARDIAN WARNINGS:", flush=True)
+        for warning in warnings:
+            print(f" - {warning}", flush=True)
+    else:
+        overall = "HEALTHY"
+        print(f"GUARDIAN STATUS: {overall}", flush=True)
+
     print("ACTION: OBSERVE ONLY", flush=True)
     print("NO SENDS; NO TRADES; NO PRODUCTION CHANGES", flush=True)
     print(f"CYCLE DURATION: {time.monotonic() - started:.2f}s", flush=True)
