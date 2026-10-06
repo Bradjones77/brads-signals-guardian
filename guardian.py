@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """
 BRAD'S SIGNALS GUARDIAN
-G1.2 - Scanner health monitor
+G1.3 - Failure & anomaly detector
 
 Observer-only:
 - PostgreSQL SELECTs only; session forced read-only.
-- Redis reads only (PING / HGETALL / TTL / GET).
+- Redis reads only.
 - No Redis writes.
 - No Telegram.
 - No trades.
 - No production modification.
 - No emergency pause.
+- No AI calls.
 
-G1.2 is grounded in Bot 2.0's actual shared Redis telemetry:
-- signals2:health
-- signals2:watchdog
-- signals2:scanner_lock
+G1.3 watches:
+- PostgreSQL availability and opportunity freshness
+- opportunity-flow gaps across Guardian checks
+- Bot 2.0 shared scanner heartbeat
+- Bot 2.0 watchdog warnings
+- consecutive scanner failures
+- scanner duration anomalies
+- Redis health
+- scanner-lock anomalies
 
-It also independently checks PostgreSQL opportunity freshness so Guardian
-does not rely on the bot's own opinion of its health.
+IMPORTANT:
+Warnings cause observation/logging only. Guardian does not intervene.
 """
 
 import os
@@ -29,7 +35,7 @@ import psycopg2
 import redis
 
 
-GUARDIAN_VERSION = "G1.2-SCANNER-HEALTH-MONITOR"
+GUARDIAN_VERSION = "G1.3-FAILURE-ANOMALY-DETECTOR"
 
 DATABASE_WRITES = False
 REDIS_WRITES = False
@@ -43,18 +49,23 @@ CHECK_INTERVAL_SECONDS = int(
     os.environ.get("GUARDIAN_CHECK_INTERVAL_SECONDS", "60")
 )
 
-# Bot 2.0 normally scans on a 5-minute cadence. Bot 2.0 itself uses
-# 720 seconds for scanner staleness, so Guardian independently uses
-# the same generous 12-minute limit for the shared scanner heartbeat.
 SCANNER_STALE_SECONDS = int(
     os.environ.get("GUARDIAN_SCANNER_STALE_SECONDS", "720")
 )
 
-# Independent DB evidence gets a slightly wider window because a cycle
-# may legitimately be skipped/locked during deployment overlap.
 OPPORTUNITY_STALE_SECONDS = int(
     os.environ.get("GUARDIAN_OPPORTUNITY_STALE_SECONDS", "900")
 )
+
+# Current healthy runtime showed ~101 seconds. This limit is deliberately
+# generous so normal variation does not trigger noise.
+SCANNER_SLOW_SECONDS = float(
+    os.environ.get("GUARDIAN_SCANNER_SLOW_SECONDS", "240")
+)
+
+# Production scanner lock TTL is 240 seconds. A live lock at/under that TTL
+# is normal. Guardian warns only if Redis reports something inconsistent.
+EXPECTED_SCANNER_LOCK_MAX_TTL = 240
 
 REDIS_HEALTH_KEY = "signals2:health"
 REDIS_WATCHDOG_KEY = "signals2:watchdog"
@@ -63,6 +74,9 @@ REDIS_SCANNER_LOCK_KEY = "signals2:scanner_lock"
 SEP = "=" * 100
 
 _previous_opportunity_count = None
+_no_growth_checks = 0
+_previous_last_scan = None
+_unchanged_heartbeat_checks = 0
 
 
 def section(title):
@@ -96,6 +110,20 @@ def seconds_old(value, now):
     return max(0.0, (now - parsed).total_seconds())
 
 
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def safe_float(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
 def database_snapshot():
     url = os.environ.get("SIGNALS2_DATABASE_URL") or os.environ.get("DATABASE_URL")
     if not url:
@@ -116,7 +144,7 @@ def database_snapshot():
                 FROM public.signals2_opportunities
                 """
             )
-            db_time, opportunity_count, latest_opportunity_time = cur.fetchone()
+            db_time, opportunity_count, latest_created_at = cur.fetchone()
 
         conn.rollback()
 
@@ -125,7 +153,7 @@ def database_snapshot():
             "message": "READY | READ ONLY",
             "db_time": db_time,
             "opportunity_count": int(opportunity_count),
-            "latest_opportunity_time": latest_opportunity_time,
+            "latest_created_at": latest_created_at,
         }
 
     except Exception as exc:
@@ -158,7 +186,7 @@ def redis_snapshot():
         if not client.ping():
             return {"ok": False, "message": "PING RETURNED FALSE"}
 
-        # READS ONLY. Guardian never SETs/HSETs/EXPIREs/DELs production keys.
+        # READS ONLY.
         health = client.hgetall(REDIS_HEALTH_KEY)
         watchdog = client.hgetall(REDIS_WATCHDOG_KEY)
         health_ttl = client.ttl(REDIS_HEALTH_KEY)
@@ -214,29 +242,36 @@ def print_banner():
     print(f"CHECK INTERVAL: {CHECK_INTERVAL_SECONDS}s", flush=True)
     print(f"SCANNER STALE LIMIT: {SCANNER_STALE_SECONDS}s", flush=True)
     print(f"OPPORTUNITY STALE LIMIT: {OPPORTUNITY_STALE_SECONDS}s", flush=True)
+    print(f"SCANNER SLOW LIMIT: {SCANNER_SLOW_SECONDS:.0f}s", flush=True)
     print("SAFETY CHECK: PASS", flush=True)
+
+
+def add_warning(warnings, code, detail):
+    warnings.append((code, detail))
 
 
 def run_cycle(cycle):
     global _previous_opportunity_count
+    global _no_growth_checks
+    global _previous_last_scan
+    global _unchanged_heartbeat_checks
 
     started = time.monotonic()
     now = utc_now()
 
     db = database_snapshot()
     redis_data = redis_snapshot()
-
     warnings = []
 
     section(f"GUARDIAN CYCLE {cycle}")
     print(f"UTC: {now.isoformat()}", flush=True)
 
     # ------------------------------------------------------------
-    # 1. Independent PostgreSQL activity evidence
+    # 1. Independent PostgreSQL evidence
     # ------------------------------------------------------------
     if db["ok"]:
         count = db["opportunity_count"]
-        latest = db["latest_opportunity_time"]
+        latest = db["latest_created_at"]
         age = seconds_old(latest, now)
 
         print(
@@ -245,8 +280,8 @@ def run_cycle(cycle):
         )
 
         if latest is None:
-            warnings.append("NO OPPORTUNITIES FOUND")
-            print("DB ACTIVITY: WARNING | no opportunity timestamp found", flush=True)
+            add_warning(warnings, "DB_NO_OPPORTUNITIES", "no opportunity timestamp found")
+            print("LATEST OPPORTUNITY: WARNING | missing", flush=True)
         else:
             freshness = (
                 "HEALTHY"
@@ -258,37 +293,61 @@ def run_cycle(cycle):
                 flush=True,
             )
             if freshness == "STALE":
-                warnings.append(f"OPPORTUNITY DATA STALE ({age:.0f}s old)")
+                add_warning(
+                    warnings,
+                    "DB_OPPORTUNITY_STALE",
+                    f"latest opportunity is {age:.0f}s old",
+                )
 
         if _previous_opportunity_count is None:
+            _no_growth_checks = 0
             print(
                 f"OPPORTUNITY FLOW: BASELINE CAPTURED | count={count}",
                 flush=True,
             )
         else:
             delta = count - _previous_opportunity_count
+
             if delta < 0:
-                warnings.append("OPPORTUNITY COUNT MOVED BACKWARDS")
+                _no_growth_checks = 0
+                add_warning(
+                    warnings,
+                    "DB_COUNT_REVERSED",
+                    f"opportunity count moved backwards by {abs(delta)}",
+                )
                 print(f"OPPORTUNITY FLOW: WARNING | delta={delta}", flush=True)
+
             elif delta == 0:
+                _no_growth_checks += 1
                 print(
-                    "OPPORTUNITY FLOW: NO NEW ROWS THIS GUARDIAN CYCLE "
-                    "| not automatically an error",
+                    "OPPORTUNITY FLOW: NO NEW ROWS "
+                    f"| consecutive Guardian checks={_no_growth_checks}",
                     flush=True,
                 )
+
+                # Do not warn merely because one-minute checks see no growth.
+                # Freshness is the authoritative stale-data test.
+                if age is not None and age > OPPORTUNITY_STALE_SECONDS:
+                    add_warning(
+                        warnings,
+                        "DB_FLOW_STALLED",
+                        f"no growth and latest row is {age:.0f}s old",
+                    )
             else:
+                _no_growth_checks = 0
                 print(
                     f"OPPORTUNITY FLOW: ACTIVE | +{delta} rows since prior check",
                     flush=True,
                 )
 
         _previous_opportunity_count = count
+
     else:
-        warnings.append("POSTGRES UNAVAILABLE")
+        add_warning(warnings, "POSTGRES_UNAVAILABLE", db["message"])
         print(f"POSTGRES: WARNING | {db['message']}", flush=True)
 
     # ------------------------------------------------------------
-    # 2. Bot 2.0's actual shared Redis health/watchdog telemetry
+    # 2. Redis + real Bot 2.0 heartbeat/watchdog
     # ------------------------------------------------------------
     if redis_data["ok"]:
         print(f"REDIS: HEALTHY | {redis_data['message']}", flush=True)
@@ -297,25 +356,41 @@ def run_cycle(cycle):
         watchdog = redis_data["watchdog"]
 
         if not health:
-            warnings.append("BOT HEALTH KEY MISSING")
-            print(
-                f"BOT HEARTBEAT: WARNING | {REDIS_HEALTH_KEY} missing/expired",
-                flush=True,
+            add_warning(
+                warnings,
+                "BOT_HEALTH_KEY_MISSING",
+                f"{REDIS_HEALTH_KEY} missing or expired",
             )
+            print("BOT HEARTBEAT: WARNING | shared health key missing", flush=True)
+
         else:
             last_scan = health.get("last_scan")
             scan_age = seconds_old(last_scan, now)
             source = health.get("source")
             last_error = health.get("last_error")
-            scanner_failures = health.get("scanner_failures_consecutive")
-            last_scan_duration = health.get("last_scan_duration_seconds")
+            failures = safe_int(health.get("scanner_failures_consecutive"), 0)
+            duration = safe_float(health.get("last_scan_duration_seconds"))
+
+            if last_scan == _previous_last_scan and last_scan not in (None, "", "None"):
+                _unchanged_heartbeat_checks += 1
+            else:
+                _unchanged_heartbeat_checks = 0
+            _previous_last_scan = last_scan
 
             if scan_age is None:
-                warnings.append("BOT LAST_SCAN INVALID OR MISSING")
                 scanner_status = "WARNING"
+                add_warning(
+                    warnings,
+                    "SCANNER_HEARTBEAT_INVALID",
+                    "last_scan is missing or invalid",
+                )
             elif scan_age > SCANNER_STALE_SECONDS:
-                warnings.append(f"BOT SCANNER HEARTBEAT STALE ({scan_age:.0f}s old)")
                 scanner_status = "STALE"
+                add_warning(
+                    warnings,
+                    "SCANNER_HEARTBEAT_STALE",
+                    f"last scanner heartbeat is {scan_age:.0f}s old",
+                )
             else:
                 scanner_status = "HEALTHY"
 
@@ -324,50 +399,61 @@ def run_cycle(cycle):
                 f"status={scanner_status} | source={source} | "
                 f"last_scan={last_scan} | "
                 f"age={None if scan_age is None else round(scan_age, 1)}s | "
-                f"duration={last_scan_duration}s | "
-                f"scanner_failures={scanner_failures} | "
-                f"last_error={last_error} | "
-                f"redis_ttl={redis_data['health_ttl']}s",
+                f"unchanged_checks={_unchanged_heartbeat_checks} | "
+                f"duration={duration}s | scanner_failures={failures} | "
+                f"last_error={last_error} | redis_ttl={redis_data['health_ttl']}s",
                 flush=True,
             )
 
-            try:
-                failures = int(scanner_failures or 0)
-            except Exception:
-                failures = 0
-
             if failures >= 3:
-                warnings.append(
-                    f"BOT REPORTS REPEATED SCANNER FAILURES ({failures})"
+                add_warning(
+                    warnings,
+                    "SCANNER_REPEATED_FAILURES",
+                    f"Bot reports {failures} consecutive scanner failures",
+                )
+
+            if duration is not None and duration > SCANNER_SLOW_SECONDS:
+                add_warning(
+                    warnings,
+                    "SCANNER_SLOW",
+                    f"last scanner duration {duration:.1f}s exceeds "
+                    f"{SCANNER_SLOW_SECONDS:.0f}s limit",
                 )
 
             if last_error not in (None, "", "None"):
-                print(
-                    f"BOT LAST ERROR OBSERVED: {last_error}",
-                    flush=True,
-                )
+                print(f"BOT LAST ERROR OBSERVED: {last_error}", flush=True)
 
         if not watchdog:
-            warnings.append("BOT WATCHDOG KEY MISSING")
-            print(
-                f"BOT WATCHDOG: WARNING | {REDIS_WATCHDOG_KEY} missing/expired",
-                flush=True,
+            add_warning(
+                warnings,
+                "BOT_WATCHDOG_KEY_MISSING",
+                f"{REDIS_WATCHDOG_KEY} missing or expired",
             )
+            print("BOT WATCHDOG: WARNING | shared watchdog key missing", flush=True)
+
         else:
             wd_status = watchdog.get("status", "UNKNOWN")
             wd_issues = watchdog.get("issues", "unknown")
             wd_source = watchdog.get("source", "unknown")
+            wd_scan_age = watchdog.get("scan_age_seconds")
+            wd_db_age = watchdog.get("db_age_seconds")
+            wd_scanner_failures = watchdog.get("scanner_failures_consecutive")
 
             print(
                 "BOT WATCHDOG: "
                 f"status={wd_status} | issues={wd_issues} | "
-                f"source={wd_source} | redis_ttl={redis_data['watchdog_ttl']}s",
+                f"source={wd_source} | scan_age={wd_scan_age}s | "
+                f"db_age={wd_db_age}s | "
+                f"scanner_failures={wd_scanner_failures} | "
+                f"redis_ttl={redis_data['watchdog_ttl']}s",
                 flush=True,
             )
 
             if wd_status != "HEALTHY":
-                warnings.append(
-                    f"BOT WATCHDOG REPORTS {wd_status}: {wd_issues}"
+                add_warning(
+                    warnings,
+                    "BOT_WATCHDOG_WARNING",
+                    f"status={wd_status}; issues={wd_issues}",
                 )
 
         lock_value = redis_data["scanner_lock_value"]
@@ -380,26 +466,40 @@ def run_cycle(cycle):
             )
         else:
             print(
-                f"SCANNER LOCK: currently held | token={lock_value} | ttl={lock_ttl}s",
+                f"SCANNER LOCK: held | token={lock_value} | ttl={lock_ttl}s",
                 flush=True,
             )
-            # The production lock is intentionally short-lived (240s).
-            # Merely seeing it held is NOT an error; Guardian only observes it.
+
+            if lock_ttl is not None and lock_ttl > EXPECTED_SCANNER_LOCK_MAX_TTL:
+                add_warning(
+                    warnings,
+                    "SCANNER_LOCK_TTL_ABNORMAL",
+                    f"lock TTL {lock_ttl}s exceeds expected "
+                    f"{EXPECTED_SCANNER_LOCK_MAX_TTL}s",
+                )
+
+            if lock_ttl == -1:
+                add_warning(
+                    warnings,
+                    "SCANNER_LOCK_NO_EXPIRY",
+                    "scanner lock exists without an expiry",
+                )
 
     else:
-        warnings.append("REDIS UNAVAILABLE")
+        add_warning(warnings, "REDIS_UNAVAILABLE", redis_data["message"])
         print(f"REDIS: WARNING | {redis_data['message']}", flush=True)
 
     # ------------------------------------------------------------
-    # 3. Independent Guardian verdict
+    # 3. Guardian anomaly summary
     # ------------------------------------------------------------
     if warnings:
         print("GUARDIAN STATUS: WARNING", flush=True)
-        print("GUARDIAN WARNINGS:", flush=True)
-        for warning in warnings:
-            print(f" - {warning}", flush=True)
+        print(f"ANOMALIES DETECTED: {len(warnings)}", flush=True)
+        for code, detail in warnings:
+            print(f" - {code}: {detail}", flush=True)
     else:
         print("GUARDIAN STATUS: HEALTHY", flush=True)
+        print("ANOMALIES DETECTED: 0", flush=True)
 
     print("ACTION: OBSERVE ONLY", flush=True)
     print("NO WRITES; NO SENDS; NO TRADES; NO PRODUCTION CHANGES", flush=True)
@@ -411,7 +511,6 @@ def main():
     print_banner()
 
     cycle = 0
-
     while True:
         cycle += 1
 
