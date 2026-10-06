@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 """
 BRAD'S SIGNALS GUARDIAN
-G1.3 - Failure & anomaly detector
+G1.4 - Telegram safety alerts
 
-Observer-only:
+Observer/safety-alert service:
 - PostgreSQL SELECTs only; session forced read-only.
 - Redis reads only.
+- Telegram sends ONLY Guardian health alerts/recovery notices.
 - No Redis writes.
-- No Telegram.
+- No database writes.
 - No trades.
 - No production modification.
 - No emergency pause.
 - No AI calls.
 
-G1.3 watches:
-- PostgreSQL availability and opportunity freshness
-- opportunity-flow gaps across Guardian checks
-- Bot 2.0 shared scanner heartbeat
-- Bot 2.0 watchdog warnings
-- consecutive scanner failures
-- scanner duration anomalies
-- Redis health
-- scanner-lock anomalies
+Alerts:
+- HEALTHY -> WARNING: immediate Telegram alert
+- WARNING -> HEALTHY: recovery Telegram message
+- Persistent same warning: reminder only after cooldown
+- Changed warning set: immediate updated alert
 
-IMPORTANT:
-Warnings cause observation/logging only. Guardian does not intervene.
+Guardian never sends trading signals and never changes Bot 2.0.
 """
 
 import os
@@ -33,13 +29,14 @@ from datetime import datetime, timezone
 
 import psycopg2
 import redis
+import requests
 
 
-GUARDIAN_VERSION = "G1.3-FAILURE-ANOMALY-DETECTOR"
+GUARDIAN_VERSION = "G1.4-TELEGRAM-SAFETY-ALERTS"
 
 DATABASE_WRITES = False
 REDIS_WRITES = False
-TELEGRAM_SENDING = False
+TELEGRAM_SAFETY_ALERTS = True
 TRADE_EXECUTION = False
 PRODUCTION_MODIFICATION = False
 EMERGENCY_PAUSE = False
@@ -48,23 +45,19 @@ AI_CALLS = False
 CHECK_INTERVAL_SECONDS = int(
     os.environ.get("GUARDIAN_CHECK_INTERVAL_SECONDS", "60")
 )
-
 SCANNER_STALE_SECONDS = int(
     os.environ.get("GUARDIAN_SCANNER_STALE_SECONDS", "720")
 )
-
 OPPORTUNITY_STALE_SECONDS = int(
     os.environ.get("GUARDIAN_OPPORTUNITY_STALE_SECONDS", "900")
 )
-
-# Current healthy runtime showed ~101 seconds. This limit is deliberately
-# generous so normal variation does not trigger noise.
 SCANNER_SLOW_SECONDS = float(
     os.environ.get("GUARDIAN_SCANNER_SLOW_SECONDS", "240")
 )
+ALERT_COOLDOWN_SECONDS = int(
+    os.environ.get("GUARDIAN_ALERT_COOLDOWN_SECONDS", "1800")
+)
 
-# Production scanner lock TTL is 240 seconds. A live lock at/under that TTL
-# is normal. Guardian warns only if Redis reports something inconsistent.
 EXPECTED_SCANNER_LOCK_MAX_TTL = 240
 
 REDIS_HEALTH_KEY = "signals2:health"
@@ -77,6 +70,10 @@ _previous_opportunity_count = None
 _no_growth_checks = 0
 _previous_last_scan = None
 _unchanged_heartbeat_checks = 0
+
+_previous_guardian_status = None
+_previous_warning_signature = None
+_last_alert_monotonic = None
 
 
 def section(title):
@@ -147,7 +144,6 @@ def database_snapshot():
             db_time, opportunity_count, latest_created_at = cur.fetchone()
 
         conn.rollback()
-
         return {
             "ok": True,
             "message": "READY | READ ONLY",
@@ -155,13 +151,8 @@ def database_snapshot():
             "opportunity_count": int(opportunity_count),
             "latest_created_at": latest_created_at,
         }
-
     except Exception as exc:
-        return {
-            "ok": False,
-            "message": f"{type(exc).__name__}: {exc}",
-        }
-
+        return {"ok": False, "message": f"{type(exc).__name__}: {exc}"}
     finally:
         if conn is not None:
             try:
@@ -182,49 +173,185 @@ def redis_snapshot():
             socket_timeout=10,
             decode_responses=True,
         )
-
         if not client.ping():
             return {"ok": False, "message": "PING RETURNED FALSE"}
-
-        # READS ONLY.
-        health = client.hgetall(REDIS_HEALTH_KEY)
-        watchdog = client.hgetall(REDIS_WATCHDOG_KEY)
-        health_ttl = client.ttl(REDIS_HEALTH_KEY)
-        watchdog_ttl = client.ttl(REDIS_WATCHDOG_KEY)
-        scanner_lock_value = client.get(REDIS_SCANNER_LOCK_KEY)
-        scanner_lock_ttl = client.ttl(REDIS_SCANNER_LOCK_KEY)
 
         return {
             "ok": True,
             "message": "READY | READ ONLY",
-            "health": health,
-            "watchdog": watchdog,
-            "health_ttl": health_ttl,
-            "watchdog_ttl": watchdog_ttl,
-            "scanner_lock_value": scanner_lock_value,
-            "scanner_lock_ttl": scanner_lock_ttl,
+            "health": client.hgetall(REDIS_HEALTH_KEY),
+            "watchdog": client.hgetall(REDIS_WATCHDOG_KEY),
+            "health_ttl": client.ttl(REDIS_HEALTH_KEY),
+            "watchdog_ttl": client.ttl(REDIS_WATCHDOG_KEY),
+            "scanner_lock_value": client.get(REDIS_SCANNER_LOCK_KEY),
+            "scanner_lock_ttl": client.ttl(REDIS_SCANNER_LOCK_KEY),
         }
-
     except Exception as exc:
-        return {
-            "ok": False,
-            "message": f"{type(exc).__name__}: {exc}",
-        }
+        return {"ok": False, "message": f"{type(exc).__name__}: {exc}"}
+
+
+def telegram_configured():
+    token = os.environ.get("GUARDIAN_TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("GUARDIAN_TELEGRAM_CHAT_ID", "").strip()
+    return bool(token and chat_id)
+
+
+def send_guardian_telegram(message):
+    """Send Guardian health text only. Never trading content."""
+    token = os.environ.get("GUARDIAN_TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("GUARDIAN_TELEGRAM_CHAT_ID", "").strip()
+
+    if not token or not chat_id:
+        print("GUARDIAN TELEGRAM: NOT CONFIGURED | alert not sent", flush=True)
+        return False
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": message,
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+        if response.ok:
+            print("GUARDIAN TELEGRAM: SENT", flush=True)
+            return True
+
+        print(
+            f"GUARDIAN TELEGRAM: FAIL | HTTP {response.status_code}",
+            flush=True,
+        )
+        return False
+    except Exception as exc:
+        print(
+            f"GUARDIAN TELEGRAM: FAIL | {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return False
+
+
+def warning_signature(warnings):
+    return "|".join(sorted(code for code, _ in warnings))
+
+
+def format_alert(warnings, now):
+    lines = [
+        "🚨 BRAD'S SIGNALS GUARDIAN ALERT",
+        "",
+        f"Time: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"Problems detected: {len(warnings)}",
+        "",
+    ]
+    for code, detail in warnings:
+        lines.append(f"• {code}: {detail}")
+
+    lines.extend(
+        [
+            "",
+            "Guardian action: OBSERVE + ALERT ONLY",
+            "No trades. No production changes.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def format_recovery(now):
+    return "\n".join(
+        [
+            "✅ BRAD'S SIGNALS GUARDIAN RECOVERY",
+            "",
+            f"Time: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            "Guardian status is HEALTHY again.",
+            "",
+            "Bot monitoring has returned to normal.",
+            "No trades or production changes were made.",
+        ]
+    )
+
+
+def maybe_send_status_alert(status, warnings, now):
+    global _previous_guardian_status
+    global _previous_warning_signature
+    global _last_alert_monotonic
+
+    current_signature = warning_signature(warnings)
+    current_mono = time.monotonic()
+
+    # Do not send a startup "healthy" message. It creates noise on redeploy.
+    if _previous_guardian_status is None:
+        _previous_guardian_status = status
+        _previous_warning_signature = current_signature
+        if status == "WARNING":
+            sent = send_guardian_telegram(format_alert(warnings, now))
+            if sent:
+                _last_alert_monotonic = current_mono
+            print("ALERT DECISION: STARTUP WARNING", flush=True)
+        else:
+            print("ALERT DECISION: STARTUP HEALTHY | no Telegram needed", flush=True)
+        return
+
+    if status == "WARNING":
+        changed = current_signature != _previous_warning_signature
+        transitioned = _previous_guardian_status != "WARNING"
+
+        cooldown_elapsed = (
+            _last_alert_monotonic is None
+            or (current_mono - _last_alert_monotonic) >= ALERT_COOLDOWN_SECONDS
+        )
+
+        if transitioned:
+            reason = "HEALTHY -> WARNING"
+        elif changed:
+            reason = "WARNING SET CHANGED"
+        elif cooldown_elapsed:
+            reason = "PERSISTENT WARNING COOLDOWN ELAPSED"
+        else:
+            reason = None
+
+        if reason:
+            sent = send_guardian_telegram(format_alert(warnings, now))
+            if sent:
+                _last_alert_monotonic = current_mono
+            print(f"ALERT DECISION: SEND | {reason}", flush=True)
+        else:
+            remaining = ALERT_COOLDOWN_SECONDS
+            if _last_alert_monotonic is not None:
+                remaining = max(
+                    0,
+                    int(
+                        ALERT_COOLDOWN_SECONDS
+                        - (current_mono - _last_alert_monotonic)
+                    ),
+                )
+            print(
+                f"ALERT DECISION: SUPPRESS DUPLICATE | cooldown_remaining={remaining}s",
+                flush=True,
+            )
+
+    elif status == "HEALTHY" and _previous_guardian_status == "WARNING":
+        send_guardian_telegram(format_recovery(now))
+        print("ALERT DECISION: SEND | WARNING -> HEALTHY RECOVERY", flush=True)
+
+    else:
+        print("ALERT DECISION: HEALTHY | no Telegram needed", flush=True)
+
+    _previous_guardian_status = status
+    _previous_warning_signature = current_signature
 
 
 def safety_check():
-    unsafe = any(
+    if any(
         (
             DATABASE_WRITES,
             REDIS_WRITES,
-            TELEGRAM_SENDING,
             TRADE_EXECUTION,
             PRODUCTION_MODIFICATION,
             EMERGENCY_PAUSE,
             AI_CALLS,
         )
-    )
-    if unsafe:
+    ):
         raise RuntimeError("GUARDIAN SAFETY FLAGS INVALID")
 
 
@@ -234,7 +361,8 @@ def print_banner():
     print(f"UTC START: {utc_now().isoformat()}", flush=True)
     print(f"DATABASE WRITES: {DATABASE_WRITES}", flush=True)
     print(f"REDIS WRITES: {REDIS_WRITES}", flush=True)
-    print(f"TELEGRAM SENDING: {TELEGRAM_SENDING}", flush=True)
+    print(f"TELEGRAM SAFETY ALERTS: {TELEGRAM_SAFETY_ALERTS}", flush=True)
+    print(f"TELEGRAM CONFIGURED: {telegram_configured()}", flush=True)
     print(f"TRADE EXECUTION: {TRADE_EXECUTION}", flush=True)
     print(f"PRODUCTION MODIFICATION: {PRODUCTION_MODIFICATION}", flush=True)
     print(f"EMERGENCY PAUSE: {EMERGENCY_PAUSE}", flush=True)
@@ -243,6 +371,7 @@ def print_banner():
     print(f"SCANNER STALE LIMIT: {SCANNER_STALE_SECONDS}s", flush=True)
     print(f"OPPORTUNITY STALE LIMIT: {OPPORTUNITY_STALE_SECONDS}s", flush=True)
     print(f"SCANNER SLOW LIMIT: {SCANNER_SLOW_SECONDS:.0f}s", flush=True)
+    print(f"ALERT COOLDOWN: {ALERT_COOLDOWN_SECONDS}s", flush=True)
     print("SAFETY CHECK: PASS", flush=True)
 
 
@@ -258,7 +387,6 @@ def run_cycle(cycle):
 
     started = time.monotonic()
     now = utc_now()
-
     db = database_snapshot()
     redis_data = redis_snapshot()
     warnings = []
@@ -266,9 +394,6 @@ def run_cycle(cycle):
     section(f"GUARDIAN CYCLE {cycle}")
     print(f"UTC: {now.isoformat()}", flush=True)
 
-    # ------------------------------------------------------------
-    # 1. Independent PostgreSQL evidence
-    # ------------------------------------------------------------
     if db["ok"]:
         count = db["opportunity_count"]
         latest = db["latest_created_at"]
@@ -301,13 +426,9 @@ def run_cycle(cycle):
 
         if _previous_opportunity_count is None:
             _no_growth_checks = 0
-            print(
-                f"OPPORTUNITY FLOW: BASELINE CAPTURED | count={count}",
-                flush=True,
-            )
+            print(f"OPPORTUNITY FLOW: BASELINE CAPTURED | count={count}", flush=True)
         else:
             delta = count - _previous_opportunity_count
-
             if delta < 0:
                 _no_growth_checks = 0
                 add_warning(
@@ -316,7 +437,6 @@ def run_cycle(cycle):
                     f"opportunity count moved backwards by {abs(delta)}",
                 )
                 print(f"OPPORTUNITY FLOW: WARNING | delta={delta}", flush=True)
-
             elif delta == 0:
                 _no_growth_checks += 1
                 print(
@@ -324,9 +444,6 @@ def run_cycle(cycle):
                     f"| consecutive Guardian checks={_no_growth_checks}",
                     flush=True,
                 )
-
-                # Do not warn merely because one-minute checks see no growth.
-                # Freshness is the authoritative stale-data test.
                 if age is not None and age > OPPORTUNITY_STALE_SECONDS:
                     add_warning(
                         warnings,
@@ -341,17 +458,12 @@ def run_cycle(cycle):
                 )
 
         _previous_opportunity_count = count
-
     else:
         add_warning(warnings, "POSTGRES_UNAVAILABLE", db["message"])
         print(f"POSTGRES: WARNING | {db['message']}", flush=True)
 
-    # ------------------------------------------------------------
-    # 2. Redis + real Bot 2.0 heartbeat/watchdog
-    # ------------------------------------------------------------
     if redis_data["ok"]:
         print(f"REDIS: HEALTHY | {redis_data['message']}", flush=True)
-
         health = redis_data["health"]
         watchdog = redis_data["watchdog"]
 
@@ -362,7 +474,6 @@ def run_cycle(cycle):
                 f"{REDIS_HEALTH_KEY} missing or expired",
             )
             print("BOT HEARTBEAT: WARNING | shared health key missing", flush=True)
-
         else:
             last_scan = health.get("last_scan")
             scan_age = seconds_old(last_scan, now)
@@ -430,7 +541,6 @@ def run_cycle(cycle):
                 f"{REDIS_WATCHDOG_KEY} missing or expired",
             )
             print("BOT WATCHDOG: WARNING | shared watchdog key missing", flush=True)
-
         else:
             wd_status = watchdog.get("status", "UNKNOWN")
             wd_issues = watchdog.get("issues", "unknown")
@@ -443,8 +553,7 @@ def run_cycle(cycle):
                 "BOT WATCHDOG: "
                 f"status={wd_status} | issues={wd_issues} | "
                 f"source={wd_source} | scan_age={wd_scan_age}s | "
-                f"db_age={wd_db_age}s | "
-                f"scanner_failures={wd_scanner_failures} | "
+                f"db_age={wd_db_age}s | scanner_failures={wd_scanner_failures} | "
                 f"redis_ttl={redis_data['watchdog_ttl']}s",
                 flush=True,
             )
@@ -469,7 +578,6 @@ def run_cycle(cycle):
                 f"SCANNER LOCK: held | token={lock_value} | ttl={lock_ttl}s",
                 flush=True,
             )
-
             if lock_ttl is not None and lock_ttl > EXPECTED_SCANNER_LOCK_MAX_TTL:
                 add_warning(
                     warnings,
@@ -477,21 +585,18 @@ def run_cycle(cycle):
                     f"lock TTL {lock_ttl}s exceeds expected "
                     f"{EXPECTED_SCANNER_LOCK_MAX_TTL}s",
                 )
-
             if lock_ttl == -1:
                 add_warning(
                     warnings,
                     "SCANNER_LOCK_NO_EXPIRY",
                     "scanner lock exists without an expiry",
                 )
-
     else:
         add_warning(warnings, "REDIS_UNAVAILABLE", redis_data["message"])
         print(f"REDIS: WARNING | {redis_data['message']}", flush=True)
 
-    # ------------------------------------------------------------
-    # 3. Guardian anomaly summary
-    # ------------------------------------------------------------
+    status = "WARNING" if warnings else "HEALTHY"
+
     if warnings:
         print("GUARDIAN STATUS: WARNING", flush=True)
         print(f"ANOMALIES DETECTED: {len(warnings)}", flush=True)
@@ -501,8 +606,10 @@ def run_cycle(cycle):
         print("GUARDIAN STATUS: HEALTHY", flush=True)
         print("ANOMALIES DETECTED: 0", flush=True)
 
-    print("ACTION: OBSERVE ONLY", flush=True)
-    print("NO WRITES; NO SENDS; NO TRADES; NO PRODUCTION CHANGES", flush=True)
+    maybe_send_status_alert(status, warnings, now)
+
+    print("ACTION: OBSERVE + SAFETY ALERT ONLY", flush=True)
+    print("NO DB/REDIS WRITES; NO TRADES; NO PRODUCTION CHANGES", flush=True)
     print(f"CYCLE DURATION: {time.monotonic() - started:.2f}s", flush=True)
 
 
@@ -513,15 +620,14 @@ def main():
     cycle = 0
     while True:
         cycle += 1
-
         try:
             run_cycle(cycle)
         except Exception as exc:
             section(f"GUARDIAN CYCLE {cycle} ERROR")
             print(f"ERROR TYPE: {type(exc).__name__}", flush=True)
             print(f"ERROR: {exc}", flush=True)
-            print("GUARDIAN REMAINS OBSERVER ONLY", flush=True)
-            print("NO WRITES; NO SENDS; NO TRADES; NO PRODUCTION CHANGES", flush=True)
+            print("GUARDIAN REMAINS SAFETY-ALERT ONLY", flush=True)
+            print("NO DB/REDIS WRITES; NO TRADES; NO PRODUCTION CHANGES", flush=True)
 
         print(f"GUARDIAN: WAIT {CHECK_INTERVAL_SECONDS}s", flush=True)
         time.sleep(CHECK_INTERVAL_SECONDS)
