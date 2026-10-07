@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BRAD'S SIGNALS GUARDIAN
-G1.5 - Worker heartbeat and service-health monitoring
+G1.6 - Behaviour anomaly monitoring
 
 Observer/safety-alert service:
 - PostgreSQL SELECTs only; session forced read-only.
@@ -20,8 +20,12 @@ Alerts:
 - Persistent same warning: reminder only after cooldown
 - Changed warning set: immediate updated alert
 
-G1.5 additionally observes Bot 2.0 scanner, hourly-memory and outcome-worker
-heartbeats through the existing read-only Redis health hash.
+G1.6 additionally performs conservative cross-service behaviour checks:
+- slow outcome-worker duration
+- scanner-heartbeat versus stale PostgreSQL opportunity-flow contradiction
+- existing scanner/memory/outcome failure and staleness checks remain active
+
+It deliberately does not treat quiet AI or Telegram activity as an anomaly.
 
 Guardian never sends trading signals and never changes Bot 2.0.
 """
@@ -35,7 +39,7 @@ import redis
 import requests
 
 
-GUARDIAN_VERSION = "G1.5-WORKER-HEARTBEAT-SERVICE-HEALTH"
+GUARDIAN_VERSION = "G1.6-BEHAVIOUR-ANOMALY-MONITOR"
 
 DATABASE_WRITES = False
 REDIS_WRITES = False
@@ -71,6 +75,12 @@ OUTCOME_WORKER_STALE_SECONDS = int(
 )
 OUTCOME_WORKER_FAILURE_LIMIT = int(
     os.environ.get("GUARDIAN_OUTCOME_WORKER_FAILURE_LIMIT", "2")
+)
+OUTCOME_WORKER_SLOW_SECONDS = float(
+    os.environ.get("GUARDIAN_OUTCOME_WORKER_SLOW_SECONDS", "900")
+)
+FLOW_CONTRADICTION_CHECKS = int(
+    os.environ.get("GUARDIAN_FLOW_CONTRADICTION_CHECKS", "3")
 )
 
 EXPECTED_SCANNER_LOCK_MAX_TTL = 240
@@ -399,6 +409,8 @@ def print_banner():
         f"OUTCOME WORKER FAILURE LIMIT: {OUTCOME_WORKER_FAILURE_LIMIT}",
         flush=True,
     )
+    print(f"OUTCOME WORKER SLOW LIMIT: {OUTCOME_WORKER_SLOW_SECONDS:.0f}s", flush=True)
+    print(f"FLOW CONTRADICTION CHECKS: {FLOW_CONTRADICTION_CHECKS}", flush=True)
     print(f"ALERT COOLDOWN: {ALERT_COOLDOWN_SECONDS}s", flush=True)
     print("SAFETY CHECK: PASS", flush=True)
 
@@ -694,6 +706,16 @@ def run_cycle(cycle):
                     f"Bot reports {outcome_failures} consecutive outcome-worker failures",
                 )
 
+            # G1.6 conservative duration anomaly. First proven production cycle
+            # was ~498s, so the default warning limit is deliberately 900s.
+            if outcome_duration is not None and outcome_duration > OUTCOME_WORKER_SLOW_SECONDS:
+                add_warning(
+                    warnings,
+                    "OUTCOME_WORKER_SLOW",
+                    f"last outcome-worker duration {outcome_duration:.1f}s exceeds "
+                    f"{OUTCOME_WORKER_SLOW_SECONDS:.0f}s limit",
+                )
+
             if outcome_error not in (None, "", "None"):
                 print(
                     f"OUTCOME WORKER LAST ERROR OBSERVED: {outcome_error}",
@@ -729,6 +751,26 @@ def run_cycle(cycle):
                     warnings,
                     "BOT_WATCHDOG_WARNING",
                     f"status={wd_status}; issues={wd_issues}",
+                )
+
+        # G1.6 cross-service contradiction check. A single quiet minute is
+        # normal; warn only when DB freshness is genuinely stale while the
+        # scanner heartbeat itself remains fresh.
+        if db["ok"] and health:
+            g16_scan_age = seconds_old(health.get("last_scan"), now)
+            latest_age = seconds_old(db.get("latest_created_at"), now)
+            if (
+                _no_growth_checks >= FLOW_CONTRADICTION_CHECKS
+                and g16_scan_age is not None
+                and g16_scan_age <= SCANNER_STALE_SECONDS
+                and latest_age is not None
+                and latest_age > OPPORTUNITY_STALE_SECONDS
+            ):
+                add_warning(
+                    warnings,
+                    "SCANNER_DB_FLOW_CONTRADICTION",
+                    "scanner heartbeat is fresh but opportunity flow is stale "
+                    f"for {latest_age:.0f}s",
                 )
 
         lock_value = redis_data["scanner_lock_value"]
