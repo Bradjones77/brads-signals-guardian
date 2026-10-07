@@ -234,8 +234,28 @@ def database_snapshot():
                     COUNT(*) FILTER (
                         WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
                           AND o.symbol NOT LIKE 'SIGNALS2%%'
+                          AND r.direction_correct_10m IS NOT NULL
+                    ) AS h10m,
+                    COUNT(*) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
+                          AND r.direction_correct_30m IS NOT NULL
+                    ) AS h30m,
+                    COUNT(*) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
                           AND r.direction_correct_1h IS NOT NULL
                     ) AS h1h,
+                    COUNT(*) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
+                          AND r.direction_correct_4h IS NOT NULL
+                    ) AS h4h,
+                    COUNT(*) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
+                          AND r.direction_correct_12h IS NOT NULL
+                    ) AS h12h,
                     COUNT(*) FILTER (
                         WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
                           AND o.symbol NOT LIKE 'SIGNALS2%%'
@@ -281,10 +301,14 @@ def database_snapshot():
                 "h30s": int(oi[2] or 0),
                 "h1m": int(oi[3] or 0),
                 "h5m": int(oi[4] or 0),
-                "h1h": int(oi[5] or 0),
-                "h24h": int(oi[6] or 0),
-                "mature_pending": int(oi[7] or 0),
-                "latest_outcome_update": oi[8],
+                "h10m": int(oi[5] or 0),
+                "h30m": int(oi[6] or 0),
+                "h1h": int(oi[7] or 0),
+                "h4h": int(oi[8] or 0),
+                "h12h": int(oi[9] or 0),
+                "h24h": int(oi[10] or 0),
+                "mature_pending": int(oi[11] or 0),
+                "latest_outcome_update": oi[12],
             },
         }
     except Exception as exc:
@@ -684,7 +708,11 @@ def run_cycle(cycle):
         h30s = safe_int(integrity.get("h30s"), 0)
         h1m = safe_int(integrity.get("h1m"), 0)
         h5m = safe_int(integrity.get("h5m"), 0)
+        h10m = safe_int(integrity.get("h10m"), 0)
+        h30m = safe_int(integrity.get("h30m"), 0)
         h1h = safe_int(integrity.get("h1h"), 0)
+        h4h = safe_int(integrity.get("h4h"), 0)
+        h12h = safe_int(integrity.get("h12h"), 0)
         h24h = safe_int(integrity.get("h24h"), 0)
         mature_pending = safe_int(integrity.get("mature_pending"), 0)
         latest_outcome_update = integrity.get("latest_outcome_update")
@@ -702,20 +730,24 @@ def run_cycle(cycle):
         print(
             "OUTCOME INTEGRITY: "
             f"integrated_total={integrated_total} | complete={integrated_complete} | "
-            f"h30s={h30s} | h1m={h1m} | h5m={h5m} | h1h={h1h} | h24h={h24h} | "
+            f"h30s={h30s} (optional) | h1m={h1m} | h5m={h5m} | h10m={h10m} | "
+            f"h30m={h30m} | h1h={h1h} | h4h={h4h} | h12h={h12h} | h24h={h24h} | "
             f"mature_pending={mature_pending} | latest_update={latest_outcome_update} | "
             f"update_age={None if latest_update_age is None else round(latest_update_age, 1)}s | "
             f"complete_delta={complete_delta} | h24_delta={h24_delta}",
             flush=True,
         )
 
-        # Integrity invariants: later horizons/completion must never exceed earlier
-        # populated checkpoints, and counters must never move backwards.
-        if not (integrated_complete <= h24h <= h1h <= h5m <= h1m <= h30s <= integrated_total):
+        # Required completion contract begins at 1m. The 30s checkpoint is
+        # optional/informational and must not make an otherwise complete record fail.
+        if not (
+            integrated_complete <= h24h <= h12h <= h4h <= h1h
+            <= h30m <= h10m <= h5m <= h1m <= integrated_total
+        ):
             add_warning(
                 warnings,
                 "OUTCOME_HORIZON_INTEGRITY",
-                "integrated outcome horizon counts violate expected monotonic ordering",
+                "required integrated outcome horizon counts violate expected monotonic ordering",
             )
 
         if complete_delta is not None and complete_delta < 0:
@@ -731,11 +763,11 @@ def run_cycle(cycle):
                 f"integrated 24h population moved backwards by {abs(h24_delta)}",
             )
 
-        if integrated_total > 0 and h30s == 0:
+        if integrated_total > 0 and h1m == 0:
             add_warning(
                 warnings,
                 "OUTCOME_INTEGRATED_NOT_POPULATING",
-                f"{integrated_total} integrated rows exist but no 30s outcomes are populated",
+                f"{integrated_total} integrated rows exist but no required 1m outcomes are populated",
             )
 
         _previous_integrated_complete = integrated_complete
@@ -743,7 +775,7 @@ def run_cycle(cycle):
 
         print(
             "OUTCOME INTEGRITY STATUS: "
-            + ("POPULATED" if h30s > 0 else "EMPTY")
+            + ("POPULATED" if h1m > 0 else "EMPTY")
             + " | read-only verification",
             flush=True,
         )
