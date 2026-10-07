@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BRAD'S SIGNALS GUARDIAN
-G1.7 - AI and signal behaviour monitoring
+G1.8 - Outcome and learning integrity monitoring
 
 Observer/safety-alert service:
 - PostgreSQL SELECTs only; session forced read-only.
@@ -42,7 +42,7 @@ import redis
 import requests
 
 
-GUARDIAN_VERSION = "G1.7-AI-SIGNAL-BEHAVIOUR-MONITOR"
+GUARDIAN_VERSION = "G1.8-OUTCOME-LEARNING-INTEGRITY-MONITOR"
 
 DATABASE_WRITES = False
 REDIS_WRITES = False
@@ -108,6 +108,9 @@ _unchanged_heartbeat_checks = 0
 _previous_guardian_status = None
 _previous_warning_signature = None
 _last_alert_monotonic = None
+
+_previous_integrated_complete = None
+_previous_integrated_h24 = None
 
 
 def section(title):
@@ -200,6 +203,61 @@ def database_snapshot():
             )
             b = cur.fetchone()
 
+            # G1.8 outcome/learning integrity snapshot. SELECT only.
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
+                    ) AS integrated_total,
+                    COUNT(*) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
+                          AND r.outcome_complete = TRUE
+                    ) AS integrated_complete,
+                    COUNT(*) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
+                          AND r.direction_correct_30s IS NOT NULL
+                    ) AS h30s,
+                    COUNT(*) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
+                          AND r.direction_correct_1m IS NOT NULL
+                    ) AS h1m,
+                    COUNT(*) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
+                          AND r.direction_correct_5m IS NOT NULL
+                    ) AS h5m,
+                    COUNT(*) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
+                          AND r.direction_correct_1h IS NOT NULL
+                    ) AS h1h,
+                    COUNT(*) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
+                          AND r.direction_correct_24h IS NOT NULL
+                    ) AS h24h,
+                    COUNT(*) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
+                          AND r.outcome_complete = FALSE
+                          AND r.opportunity_time <= NOW() - INTERVAL '24 hours 5 minutes'
+                    ) AS mature_pending,
+                    MAX(r.last_updated) FILTER (
+                        WHERE o.model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                          AND o.symbol NOT LIKE 'SIGNALS2%%'
+                    ) AS latest_outcome_update
+                FROM public.signals2_opportunities o
+                JOIN public.signals2_outcomes r
+                  ON r.opportunity_id = o.opportunity_id
+                """
+            )
+            oi = cur.fetchone()
+
         conn.rollback()
         return {
             "ok": True,
@@ -216,6 +274,17 @@ def database_snapshot():
                 "max_final_confidence": float(b[5]) if b[5] is not None else None,
                 "genuine_ai_count": int(b[6] or 0),
                 "signal_sent_count": int(b[7] or 0),
+            },
+            "outcome_integrity": {
+                "integrated_total": int(oi[0] or 0),
+                "integrated_complete": int(oi[1] or 0),
+                "h30s": int(oi[2] or 0),
+                "h1m": int(oi[3] or 0),
+                "h5m": int(oi[4] or 0),
+                "h1h": int(oi[5] or 0),
+                "h24h": int(oi[6] or 0),
+                "mature_pending": int(oi[7] or 0),
+                "latest_outcome_update": oi[8],
             },
         }
     except Exception as exc:
@@ -471,6 +540,8 @@ def run_cycle(cycle):
     global _no_growth_checks
     global _previous_last_scan
     global _unchanged_heartbeat_checks
+    global _previous_integrated_complete
+    global _previous_integrated_h24
 
     started = time.monotonic()
     now = utc_now()
@@ -606,6 +677,76 @@ def run_cycle(cycle):
                 if flags == 0 else f"BEHAVIOUR STATUS: WARNING | flags={flags}",
                 flush=True,
             )
+
+        integrity = db.get("outcome_integrity") or {}
+        integrated_total = safe_int(integrity.get("integrated_total"), 0)
+        integrated_complete = safe_int(integrity.get("integrated_complete"), 0)
+        h30s = safe_int(integrity.get("h30s"), 0)
+        h1m = safe_int(integrity.get("h1m"), 0)
+        h5m = safe_int(integrity.get("h5m"), 0)
+        h1h = safe_int(integrity.get("h1h"), 0)
+        h24h = safe_int(integrity.get("h24h"), 0)
+        mature_pending = safe_int(integrity.get("mature_pending"), 0)
+        latest_outcome_update = integrity.get("latest_outcome_update")
+        latest_update_age = seconds_old(latest_outcome_update, now)
+
+        complete_delta = (
+            None if _previous_integrated_complete is None
+            else integrated_complete - _previous_integrated_complete
+        )
+        h24_delta = (
+            None if _previous_integrated_h24 is None
+            else h24h - _previous_integrated_h24
+        )
+
+        print(
+            "OUTCOME INTEGRITY: "
+            f"integrated_total={integrated_total} | complete={integrated_complete} | "
+            f"h30s={h30s} | h1m={h1m} | h5m={h5m} | h1h={h1h} | h24h={h24h} | "
+            f"mature_pending={mature_pending} | latest_update={latest_outcome_update} | "
+            f"update_age={None if latest_update_age is None else round(latest_update_age, 1)}s | "
+            f"complete_delta={complete_delta} | h24_delta={h24_delta}",
+            flush=True,
+        )
+
+        # Integrity invariants: later horizons/completion must never exceed earlier
+        # populated checkpoints, and counters must never move backwards.
+        if not (integrated_complete <= h24h <= h1h <= h5m <= h1m <= h30s <= integrated_total):
+            add_warning(
+                warnings,
+                "OUTCOME_HORIZON_INTEGRITY",
+                "integrated outcome horizon counts violate expected monotonic ordering",
+            )
+
+        if complete_delta is not None and complete_delta < 0:
+            add_warning(
+                warnings,
+                "OUTCOME_COMPLETE_COUNT_REVERSED",
+                f"integrated COMPLETE count moved backwards by {abs(complete_delta)}",
+            )
+        if h24_delta is not None and h24_delta < 0:
+            add_warning(
+                warnings,
+                "OUTCOME_24H_COUNT_REVERSED",
+                f"integrated 24h population moved backwards by {abs(h24_delta)}",
+            )
+
+        if integrated_total > 0 and h30s == 0:
+            add_warning(
+                warnings,
+                "OUTCOME_INTEGRATED_NOT_POPULATING",
+                f"{integrated_total} integrated rows exist but no 30s outcomes are populated",
+            )
+
+        _previous_integrated_complete = integrated_complete
+        _previous_integrated_h24 = h24h
+
+        print(
+            "OUTCOME INTEGRITY STATUS: "
+            + ("POPULATED" if h30s > 0 else "EMPTY")
+            + " | read-only verification",
+            flush=True,
+        )
     else:
         add_warning(warnings, "POSTGRES_UNAVAILABLE", db["message"])
         print(f"POSTGRES: WARNING | {db['message']}", flush=True)
