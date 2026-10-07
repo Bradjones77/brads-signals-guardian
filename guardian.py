@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BRAD'S SIGNALS GUARDIAN
-G1.9 - Data and model drift monitoring
+G1.10 - AI behaviour integrity monitoring
 
 Observer/safety-alert service:
 - PostgreSQL SELECTs only; session forced read-only.
@@ -42,7 +42,7 @@ import redis
 import requests
 
 
-GUARDIAN_VERSION = "G1.9-DATA-MODEL-DRIFT-MONITOR"
+GUARDIAN_VERSION = "G1.10-AI-BEHAVIOUR-INTEGRITY-MONITOR"
 
 DATABASE_WRITES = False
 REDIS_WRITES = False
@@ -99,6 +99,13 @@ DRIFT_DIRECTION_SHARE_DELTA = float(os.environ.get("GUARDIAN_DRIFT_DIRECTION_SHA
 DRIFT_AI_SHARE_DELTA = float(os.environ.get("GUARDIAN_DRIFT_AI_SHARE_DELTA", "0.25"))
 DRIFT_VOLUME_RATIO_LOW = float(os.environ.get("GUARDIAN_DRIFT_VOLUME_RATIO_LOW", "0.40"))
 DRIFT_VOLUME_RATIO_HIGH = float(os.environ.get("GUARDIAN_DRIFT_VOLUME_RATIO_HIGH", "2.50"))
+AI_INTEGRITY_WINDOW_HOURS = int(os.environ.get("GUARDIAN_AI_INTEGRITY_WINDOW_HOURS", "24"))
+AI_INTEGRITY_MIN_SAMPLE = int(os.environ.get("GUARDIAN_AI_INTEGRITY_MIN_SAMPLE", "50"))
+AI_DIRECTION_DOMINANCE_LIMIT = float(os.environ.get("GUARDIAN_AI_DIRECTION_DOMINANCE_LIMIT", "0.95"))
+AI_SCORE_LOW = float(os.environ.get("GUARDIAN_AI_SCORE_LOW", "0"))
+AI_SCORE_HIGH = float(os.environ.get("GUARDIAN_AI_SCORE_HIGH", "100"))
+AI_SCORE_MEAN_LOW = float(os.environ.get("GUARDIAN_AI_SCORE_MEAN_LOW", "10"))
+AI_SCORE_MEAN_HIGH = float(os.environ.get("GUARDIAN_AI_SCORE_MEAN_HIGH", "90"))
 
 EXPECTED_SCANNER_LOCK_MAX_TTL = 240
 
@@ -338,6 +345,38 @@ def database_snapshot():
             )
             dr = cur.fetchone()
 
+            # G1.10 genuine-AI integrity snapshot.
+            # Genuine AI requires ai_confidence plus an available ai_analysis
+            # payload containing ai_score. This deliberately excludes placeholders.
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*)::bigint AS genuine_ai_n,
+                    COUNT(*) FILTER (WHERE direction = 'LONG')::bigint AS long_n,
+                    COUNT(*) FILTER (WHERE direction = 'SHORT')::bigint AS short_n,
+                    AVG(ai_confidence) AS avg_ai_confidence,
+                    MIN(ai_confidence) AS min_ai_confidence,
+                    MAX(ai_confidence) AS max_ai_confidence,
+                    AVG((ai_analysis->>'ai_score')::double precision) AS avg_ai_score,
+                    MIN((ai_analysis->>'ai_score')::double precision) AS min_ai_score,
+                    MAX((ai_analysis->>'ai_score')::double precision) AS max_ai_score,
+                    COUNT(*) FILTER (
+                        WHERE (ai_analysis->>'ai_score')::double precision < %s
+                           OR (ai_analysis->>'ai_score')::double precision > %s
+                    )::bigint AS score_out_of_range,
+                    COUNT(*) FILTER (WHERE signal_sent = TRUE)::bigint AS signals_sent
+                FROM public.signals2_opportunities
+                WHERE created_at >= NOW() - (%s * INTERVAL '1 hour')
+                  AND symbol NOT LIKE 'SIGNALS2%%'
+                  AND model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                  AND ai_confidence IS NOT NULL
+                  AND COALESCE((ai_analysis->>'available')::boolean, FALSE) = TRUE
+                  AND ai_analysis ? 'ai_score'
+                """,
+                (AI_SCORE_LOW, AI_SCORE_HIGH, AI_INTEGRITY_WINDOW_HOURS),
+            )
+            ai = cur.fetchone()
+
         conn.rollback()
         return {
             "ok": True,
@@ -383,6 +422,19 @@ def database_snapshot():
                 "baseline_avg_conf": float(dr[9]) if dr[9] is not None else None,
                 "baseline_long_share": float(dr[10]) if dr[10] is not None else None,
                 "baseline_ai_share": float(dr[11]) if dr[11] is not None else None,
+            },
+            "ai_integrity": {
+                "genuine_ai_n": int(ai[0] or 0),
+                "long_n": int(ai[1] or 0),
+                "short_n": int(ai[2] or 0),
+                "avg_ai_confidence": float(ai[3]) if ai[3] is not None else None,
+                "min_ai_confidence": float(ai[4]) if ai[4] is not None else None,
+                "max_ai_confidence": float(ai[5]) if ai[5] is not None else None,
+                "avg_ai_score": float(ai[6]) if ai[6] is not None else None,
+                "min_ai_score": float(ai[7]) if ai[7] is not None else None,
+                "max_ai_score": float(ai[8]) if ai[8] is not None else None,
+                "score_out_of_range": int(ai[9] or 0),
+                "signals_sent": int(ai[10] or 0),
             },
         }
     except Exception as exc:
@@ -632,6 +684,11 @@ def print_banner():
     print(f"DRIFT DIRECTION SHARE DELTA: {DRIFT_DIRECTION_SHARE_DELTA:.0%}", flush=True)
     print(f"DRIFT AI SHARE DELTA: {DRIFT_AI_SHARE_DELTA:.0%}", flush=True)
     print(f"DRIFT VOLUME RATIO BOUNDS: {DRIFT_VOLUME_RATIO_LOW:.2f}-{DRIFT_VOLUME_RATIO_HIGH:.2f}", flush=True)
+    print(f"AI INTEGRITY WINDOW: {AI_INTEGRITY_WINDOW_HOURS}h", flush=True)
+    print(f"AI INTEGRITY MIN SAMPLE: {AI_INTEGRITY_MIN_SAMPLE}", flush=True)
+    print(f"AI DIRECTION DOMINANCE LIMIT: {AI_DIRECTION_DOMINANCE_LIMIT:.0%}", flush=True)
+    print(f"AI SCORE VALID RANGE: {AI_SCORE_LOW:.1f}-{AI_SCORE_HIGH:.1f}", flush=True)
+    print(f"AI SCORE MEAN BOUNDS: {AI_SCORE_MEAN_LOW:.1f}-{AI_SCORE_MEAN_HIGH:.1f}", flush=True)
     print(f"ALERT COOLDOWN: {ALERT_COOLDOWN_SECONDS}s", flush=True)
     print("SAFETY CHECK: PASS", flush=True)
 
@@ -935,6 +992,78 @@ def run_cycle(cycle):
             print(
                 "DRIFT STATUS: HEALTHY | broad historical-baseline bounds not breached"
                 if drift_flags == 0 else f"DRIFT STATUS: WARNING | flags={drift_flags}",
+                flush=True,
+            )
+
+        ai_state = db.get("ai_integrity") or {}
+        ain = safe_int(ai_state.get("genuine_ai_n"), 0)
+        ail = safe_int(ai_state.get("long_n"), 0)
+        ais = safe_int(ai_state.get("short_n"), 0)
+        aic = safe_float(ai_state.get("avg_ai_confidence"))
+        aic_min = safe_float(ai_state.get("min_ai_confidence"))
+        aic_max = safe_float(ai_state.get("max_ai_confidence"))
+        score_avg = safe_float(ai_state.get("avg_ai_score"))
+        score_min = safe_float(ai_state.get("min_ai_score"))
+        score_max = safe_float(ai_state.get("max_ai_score"))
+        score_bad = safe_int(ai_state.get("score_out_of_range"), 0)
+        ai_sent = safe_int(ai_state.get("signals_sent"), 0)
+        dominant_ai_share = (max(ail, ais) / ain) if ain > 0 else None
+        dominant_ai_direction = "LONG" if ail >= ais else "SHORT"
+
+        print(
+            "AI INTEGRITY SNAPSHOT: "
+            f"window={AI_INTEGRITY_WINDOW_HOURS}h | genuine_ai={ain} | "
+            f"LONG={ail} | SHORT={ais} | "
+            f"dominant_share={None if dominant_ai_share is None else round(dominant_ai_share, 3)} | "
+            f"avg_ai_conf={None if aic is None else round(aic, 2)} | "
+            f"min_ai_conf={None if aic_min is None else round(aic_min, 2)} | "
+            f"max_ai_conf={None if aic_max is None else round(aic_max, 2)} | "
+            f"avg_ai_score={None if score_avg is None else round(score_avg, 2)} | "
+            f"min_ai_score={None if score_min is None else round(score_min, 2)} | "
+            f"max_ai_score={None if score_max is None else round(score_max, 2)} | "
+            f"score_out_of_range={score_bad} | signals_sent={ai_sent}",
+            flush=True,
+        )
+
+        ai_flags = 0
+        if score_bad > 0:
+            add_warning(
+                warnings,
+                "AI_SCORE_OUT_OF_RANGE",
+                f"{score_bad} genuine AI observations have ai_score outside "
+                f"{AI_SCORE_LOW:.1f}-{AI_SCORE_HIGH:.1f}",
+            )
+            ai_flags += 1
+
+        if ain < AI_INTEGRITY_MIN_SAMPLE:
+            print(
+                "AI INTEGRITY STATUS: OBSERVE ONLY | insufficient genuine-AI sample",
+                flush=True,
+            )
+        else:
+            if dominant_ai_share is not None and dominant_ai_share > AI_DIRECTION_DOMINANCE_LIMIT:
+                add_warning(
+                    warnings,
+                    "AI_DIRECTION_EXTREME_IMBALANCE",
+                    f"{dominant_ai_direction} is {dominant_ai_share:.1%} of "
+                    f"{ain} genuine AI observations",
+                )
+                ai_flags += 1
+
+            if score_avg is not None and (
+                score_avg < AI_SCORE_MEAN_LOW or score_avg > AI_SCORE_MEAN_HIGH
+            ):
+                add_warning(
+                    warnings,
+                    "AI_SCORE_MEAN_ABNORMAL",
+                    f"genuine AI mean score {score_avg:.2f} is outside "
+                    f"{AI_SCORE_MEAN_LOW:.1f}-{AI_SCORE_MEAN_HIGH:.1f}",
+                )
+                ai_flags += 1
+
+            print(
+                "AI INTEGRITY STATUS: HEALTHY | broad integrity bounds not breached"
+                if ai_flags == 0 else f"AI INTEGRITY STATUS: WARNING | flags={ai_flags}",
                 flush=True,
             )
     else:
