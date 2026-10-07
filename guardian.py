@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BRAD'S SIGNALS GUARDIAN
-G1.8 - Outcome and learning integrity monitoring
+G1.9 - Data and model drift monitoring
 
 Observer/safety-alert service:
 - PostgreSQL SELECTs only; session forced read-only.
@@ -42,7 +42,7 @@ import redis
 import requests
 
 
-GUARDIAN_VERSION = "G1.8-OUTCOME-LEARNING-INTEGRITY-MONITOR"
+GUARDIAN_VERSION = "G1.9-DATA-MODEL-DRIFT-MONITOR"
 
 DATABASE_WRITES = False
 REDIS_WRITES = False
@@ -91,6 +91,14 @@ DIRECTION_IMBALANCE_LIMIT = float(os.environ.get("GUARDIAN_DIRECTION_IMBALANCE_L
 CONFIDENCE_MEAN_LOW = float(os.environ.get("GUARDIAN_CONFIDENCE_MEAN_LOW", "20"))
 CONFIDENCE_MEAN_HIGH = float(os.environ.get("GUARDIAN_CONFIDENCE_MEAN_HIGH", "95"))
 AI_PARTICIPATION_HIGH = float(os.environ.get("GUARDIAN_AI_PARTICIPATION_HIGH", "0.60"))
+DRIFT_RECENT_HOURS = int(os.environ.get("GUARDIAN_DRIFT_RECENT_HOURS", "6"))
+DRIFT_BASELINE_HOURS = int(os.environ.get("GUARDIAN_DRIFT_BASELINE_HOURS", "48"))
+DRIFT_MIN_RECENT_SAMPLE = int(os.environ.get("GUARDIAN_DRIFT_MIN_RECENT_SAMPLE", "500"))
+DRIFT_CONFIDENCE_MEAN_DELTA = float(os.environ.get("GUARDIAN_DRIFT_CONFIDENCE_MEAN_DELTA", "12"))
+DRIFT_DIRECTION_SHARE_DELTA = float(os.environ.get("GUARDIAN_DRIFT_DIRECTION_SHARE_DELTA", "0.20"))
+DRIFT_AI_SHARE_DELTA = float(os.environ.get("GUARDIAN_DRIFT_AI_SHARE_DELTA", "0.25"))
+DRIFT_VOLUME_RATIO_LOW = float(os.environ.get("GUARDIAN_DRIFT_VOLUME_RATIO_LOW", "0.40"))
+DRIFT_VOLUME_RATIO_HIGH = float(os.environ.get("GUARDIAN_DRIFT_VOLUME_RATIO_HIGH", "2.50"))
 
 EXPECTED_SCANNER_LOCK_MAX_TTL = 240
 
@@ -278,6 +286,58 @@ def database_snapshot():
             )
             oi = cur.fetchone()
 
+            # G1.9 drift snapshot: recent window versus an older historical baseline.
+            # Restrict to the current integrated model and real symbols.
+            cur.execute(
+                """
+                WITH recent AS (
+                    SELECT
+                        COUNT(*)::bigint AS n,
+                        AVG(final_confidence) AS avg_conf,
+                        AVG(CASE WHEN direction = 'LONG' THEN 1.0 ELSE 0.0 END) AS long_share,
+                        AVG(
+                            CASE WHEN ai_confidence IS NOT NULL
+                                  AND COALESCE((ai_analysis->>'available')::boolean, FALSE) = TRUE
+                                  AND ai_analysis ? 'ai_score'
+                                 THEN 1.0 ELSE 0.0 END
+                        ) AS ai_share,
+                        COUNT(DISTINCT model_version) AS model_versions,
+                        COUNT(DISTINCT strategy_version) AS strategy_versions,
+                        MAX(model_version) AS model_version,
+                        MAX(strategy_version) AS strategy_version
+                    FROM public.signals2_opportunities
+                    WHERE created_at >= NOW() - (%s * INTERVAL '1 hour')
+                      AND symbol NOT LIKE 'SIGNALS2%%'
+                      AND model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                ),
+                baseline AS (
+                    SELECT
+                        COUNT(*)::bigint AS n,
+                        AVG(final_confidence) AS avg_conf,
+                        AVG(CASE WHEN direction = 'LONG' THEN 1.0 ELSE 0.0 END) AS long_share,
+                        AVG(
+                            CASE WHEN ai_confidence IS NOT NULL
+                                  AND COALESCE((ai_analysis->>'available')::boolean, FALSE) = TRUE
+                                  AND ai_analysis ? 'ai_score'
+                                 THEN 1.0 ELSE 0.0 END
+                        ) AS ai_share
+                    FROM public.signals2_opportunities
+                    WHERE created_at < NOW() - (%s * INTERVAL '1 hour')
+                      AND created_at >= NOW() - (%s * INTERVAL '1 hour')
+                      AND symbol NOT LIKE 'SIGNALS2%%'
+                      AND model_version = 'SIGNALS2_AI_INTEGRATED_V1'
+                )
+                SELECT
+                    recent.n, recent.avg_conf, recent.long_share, recent.ai_share,
+                    recent.model_versions, recent.strategy_versions,
+                    recent.model_version, recent.strategy_version,
+                    baseline.n, baseline.avg_conf, baseline.long_share, baseline.ai_share
+                FROM recent CROSS JOIN baseline
+                """,
+                (DRIFT_RECENT_HOURS, DRIFT_RECENT_HOURS, DRIFT_BASELINE_HOURS),
+            )
+            dr = cur.fetchone()
+
         conn.rollback()
         return {
             "ok": True,
@@ -309,6 +369,20 @@ def database_snapshot():
                 "h24h": int(oi[10] or 0),
                 "mature_pending": int(oi[11] or 0),
                 "latest_outcome_update": oi[12],
+            },
+            "drift": {
+                "recent_n": int(dr[0] or 0),
+                "recent_avg_conf": float(dr[1]) if dr[1] is not None else None,
+                "recent_long_share": float(dr[2]) if dr[2] is not None else None,
+                "recent_ai_share": float(dr[3]) if dr[3] is not None else None,
+                "recent_model_versions": int(dr[4] or 0),
+                "recent_strategy_versions": int(dr[5] or 0),
+                "recent_model_version": dr[6],
+                "recent_strategy_version": dr[7],
+                "baseline_n": int(dr[8] or 0),
+                "baseline_avg_conf": float(dr[9]) if dr[9] is not None else None,
+                "baseline_long_share": float(dr[10]) if dr[10] is not None else None,
+                "baseline_ai_share": float(dr[11]) if dr[11] is not None else None,
             },
         }
     except Exception as exc:
@@ -551,6 +625,13 @@ def print_banner():
     print(f"DIRECTION IMBALANCE LIMIT: {DIRECTION_IMBALANCE_LIMIT:.0%}", flush=True)
     print(f"CONFIDENCE MEAN BOUNDS: {CONFIDENCE_MEAN_LOW:.1f}-{CONFIDENCE_MEAN_HIGH:.1f}", flush=True)
     print(f"AI PARTICIPATION HIGH LIMIT: {AI_PARTICIPATION_HIGH:.0%}", flush=True)
+    print(f"DRIFT RECENT WINDOW: {DRIFT_RECENT_HOURS}h", flush=True)
+    print(f"DRIFT BASELINE WINDOW: {DRIFT_BASELINE_HOURS}h", flush=True)
+    print(f"DRIFT MIN RECENT SAMPLE: {DRIFT_MIN_RECENT_SAMPLE}", flush=True)
+    print(f"DRIFT CONFIDENCE MEAN DELTA: {DRIFT_CONFIDENCE_MEAN_DELTA:.1f}", flush=True)
+    print(f"DRIFT DIRECTION SHARE DELTA: {DRIFT_DIRECTION_SHARE_DELTA:.0%}", flush=True)
+    print(f"DRIFT AI SHARE DELTA: {DRIFT_AI_SHARE_DELTA:.0%}", flush=True)
+    print(f"DRIFT VOLUME RATIO BOUNDS: {DRIFT_VOLUME_RATIO_LOW:.2f}-{DRIFT_VOLUME_RATIO_HIGH:.2f}", flush=True)
     print(f"ALERT COOLDOWN: {ALERT_COOLDOWN_SECONDS}s", flush=True)
     print("SAFETY CHECK: PASS", flush=True)
 
@@ -779,6 +860,83 @@ def run_cycle(cycle):
             + " | read-only verification",
             flush=True,
         )
+
+        drift = db.get("drift") or {}
+        rn = safe_int(drift.get("recent_n"), 0)
+        bn = safe_int(drift.get("baseline_n"), 0)
+        rc = safe_float(drift.get("recent_avg_conf"))
+        bc = safe_float(drift.get("baseline_avg_conf"))
+        rl = safe_float(drift.get("recent_long_share"))
+        bl = safe_float(drift.get("baseline_long_share"))
+        ra = safe_float(drift.get("recent_ai_share"))
+        ba = safe_float(drift.get("baseline_ai_share"))
+        rmv = safe_int(drift.get("recent_model_versions"), 0)
+        rsv = safe_int(drift.get("recent_strategy_versions"), 0)
+
+        baseline_hours_effective = max(1, DRIFT_BASELINE_HOURS - DRIFT_RECENT_HOURS)
+        recent_rate = rn / max(1, DRIFT_RECENT_HOURS)
+        baseline_rate = bn / baseline_hours_effective
+        volume_ratio = recent_rate / baseline_rate if baseline_rate > 0 else None
+
+        print(
+            "DRIFT SNAPSHOT: "
+            f"recent_n={rn} | baseline_n={bn} | "
+            f"recent_avg_conf={None if rc is None else round(rc, 2)} | "
+            f"baseline_avg_conf={None if bc is None else round(bc, 2)} | "
+            f"recent_LONG_share={None if rl is None else round(rl, 3)} | "
+            f"baseline_LONG_share={None if bl is None else round(bl, 3)} | "
+            f"recent_AI_share={None if ra is None else round(ra, 3)} | "
+            f"baseline_AI_share={None if ba is None else round(ba, 3)} | "
+            f"volume_ratio={None if volume_ratio is None else round(volume_ratio, 3)} | "
+            f"model={drift.get('recent_model_version')} | strategy={drift.get('recent_strategy_version')}",
+            flush=True,
+        )
+
+        if rn < DRIFT_MIN_RECENT_SAMPLE or bn < DRIFT_MIN_RECENT_SAMPLE:
+            print(
+                "DRIFT STATUS: OBSERVE ONLY | insufficient recent/baseline sample",
+                flush=True,
+            )
+        else:
+            drift_flags = 0
+            if rmv > 1 or rsv > 1:
+                add_warning(
+                    warnings, "MODEL_STRATEGY_VERSION_MIX",
+                    f"recent window contains model_versions={rmv}, strategy_versions={rsv}",
+                )
+                drift_flags += 1
+            if rc is not None and bc is not None and abs(rc - bc) > DRIFT_CONFIDENCE_MEAN_DELTA:
+                add_warning(
+                    warnings, "CONFIDENCE_MEAN_DRIFT",
+                    f"recent mean {rc:.2f} differs from baseline {bc:.2f} by {abs(rc-bc):.2f}",
+                )
+                drift_flags += 1
+            if rl is not None and bl is not None and abs(rl - bl) > DRIFT_DIRECTION_SHARE_DELTA:
+                add_warning(
+                    warnings, "DIRECTION_SHARE_DRIFT",
+                    f"recent LONG share {rl:.1%} differs from baseline {bl:.1%}",
+                )
+                drift_flags += 1
+            if ra is not None and ba is not None and abs(ra - ba) > DRIFT_AI_SHARE_DELTA:
+                add_warning(
+                    warnings, "AI_PARTICIPATION_DRIFT",
+                    f"recent AI share {ra:.1%} differs from baseline {ba:.1%}",
+                )
+                drift_flags += 1
+            if volume_ratio is not None and (
+                volume_ratio < DRIFT_VOLUME_RATIO_LOW or volume_ratio > DRIFT_VOLUME_RATIO_HIGH
+            ):
+                add_warning(
+                    warnings, "OPPORTUNITY_VOLUME_DRIFT",
+                    f"recent hourly opportunity rate is {volume_ratio:.2f}x historical baseline",
+                )
+                drift_flags += 1
+
+            print(
+                "DRIFT STATUS: HEALTHY | broad historical-baseline bounds not breached"
+                if drift_flags == 0 else f"DRIFT STATUS: WARNING | flags={drift_flags}",
+                flush=True,
+            )
     else:
         add_warning(warnings, "POSTGRES_UNAVAILABLE", db["message"])
         print(f"POSTGRES: WARNING | {db['message']}", flush=True)
