@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BRAD'S SIGNALS GUARDIAN
-G1.6 - Behaviour anomaly monitoring
+G1.7 - AI and signal behaviour monitoring
 
 Observer/safety-alert service:
 - PostgreSQL SELECTs only; session forced read-only.
@@ -20,12 +20,15 @@ Alerts:
 - Persistent same warning: reminder only after cooldown
 - Changed warning set: immediate updated alert
 
-G1.6 additionally performs conservative cross-service behaviour checks:
-- slow outcome-worker duration
-- scanner-heartbeat versus stale PostgreSQL opportunity-flow contradiction
-- existing scanner/memory/outcome failure and staleness checks remain active
+G1.7 preserves all G1.6 service-health checks and adds conservative,
+read-only behavioural observation over recent Bot 2.0 opportunities:
+- LONG/SHORT direction balance
+- final-confidence distribution
+- genuine AI participation rate
+- recent opportunity production volume
 
-It deliberately does not treat quiet AI or Telegram activity as an anomaly.
+Behaviour warnings require a minimum sample and use broad safety bounds.
+They are anomaly indicators, not trading decisions and not profitability claims.
 
 Guardian never sends trading signals and never changes Bot 2.0.
 """
@@ -39,7 +42,7 @@ import redis
 import requests
 
 
-GUARDIAN_VERSION = "G1.6-BEHAVIOUR-ANOMALY-MONITOR"
+GUARDIAN_VERSION = "G1.7-AI-SIGNAL-BEHAVIOUR-MONITOR"
 
 DATABASE_WRITES = False
 REDIS_WRITES = False
@@ -82,6 +85,12 @@ OUTCOME_WORKER_SLOW_SECONDS = float(
 FLOW_CONTRADICTION_CHECKS = int(
     os.environ.get("GUARDIAN_FLOW_CONTRADICTION_CHECKS", "3")
 )
+BEHAVIOUR_WINDOW_MINUTES = int(os.environ.get("GUARDIAN_BEHAVIOUR_WINDOW_MINUTES", "60"))
+BEHAVIOUR_MIN_SAMPLE = int(os.environ.get("GUARDIAN_BEHAVIOUR_MIN_SAMPLE", "100"))
+DIRECTION_IMBALANCE_LIMIT = float(os.environ.get("GUARDIAN_DIRECTION_IMBALANCE_LIMIT", "0.90"))
+CONFIDENCE_MEAN_LOW = float(os.environ.get("GUARDIAN_CONFIDENCE_MEAN_LOW", "20"))
+CONFIDENCE_MEAN_HIGH = float(os.environ.get("GUARDIAN_CONFIDENCE_MEAN_HIGH", "95"))
+AI_PARTICIPATION_HIGH = float(os.environ.get("GUARDIAN_AI_PARTICIPATION_HIGH", "0.60"))
 
 EXPECTED_SCANNER_LOCK_MAX_TTL = 240
 
@@ -168,6 +177,29 @@ def database_snapshot():
             )
             db_time, opportunity_count, latest_created_at = cur.fetchone()
 
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    COUNT(*) FILTER (WHERE direction = 'LONG'),
+                    COUNT(*) FILTER (WHERE direction = 'SHORT'),
+                    AVG(final_confidence) FILTER (WHERE final_confidence IS NOT NULL),
+                    MIN(final_confidence) FILTER (WHERE final_confidence IS NOT NULL),
+                    MAX(final_confidence) FILTER (WHERE final_confidence IS NOT NULL),
+                    COUNT(*) FILTER (
+                        WHERE ai_confidence IS NOT NULL
+                          AND COALESCE((ai_analysis->>'available')::boolean, FALSE) = TRUE
+                          AND ai_analysis ? 'ai_score'
+                    ),
+                    COUNT(*) FILTER (WHERE signal_sent = TRUE)
+                FROM public.signals2_opportunities
+                WHERE created_at >= NOW() - (%s * INTERVAL '1 minute')
+                  AND symbol NOT LIKE 'SIGNALS2%%'
+                """,
+                (BEHAVIOUR_WINDOW_MINUTES,),
+            )
+            b = cur.fetchone()
+
         conn.rollback()
         return {
             "ok": True,
@@ -175,6 +207,16 @@ def database_snapshot():
             "db_time": db_time,
             "opportunity_count": int(opportunity_count),
             "latest_created_at": latest_created_at,
+            "behaviour": {
+                "sample_count": int(b[0] or 0),
+                "long_count": int(b[1] or 0),
+                "short_count": int(b[2] or 0),
+                "avg_final_confidence": float(b[3]) if b[3] is not None else None,
+                "min_final_confidence": float(b[4]) if b[4] is not None else None,
+                "max_final_confidence": float(b[5]) if b[5] is not None else None,
+                "genuine_ai_count": int(b[6] or 0),
+                "signal_sent_count": int(b[7] or 0),
+            },
         }
     except Exception as exc:
         return {"ok": False, "message": f"{type(exc).__name__}: {exc}"}
@@ -411,6 +453,11 @@ def print_banner():
     )
     print(f"OUTCOME WORKER SLOW LIMIT: {OUTCOME_WORKER_SLOW_SECONDS:.0f}s", flush=True)
     print(f"FLOW CONTRADICTION CHECKS: {FLOW_CONTRADICTION_CHECKS}", flush=True)
+    print(f"BEHAVIOUR WINDOW: {BEHAVIOUR_WINDOW_MINUTES}m", flush=True)
+    print(f"BEHAVIOUR MIN SAMPLE: {BEHAVIOUR_MIN_SAMPLE}", flush=True)
+    print(f"DIRECTION IMBALANCE LIMIT: {DIRECTION_IMBALANCE_LIMIT:.0%}", flush=True)
+    print(f"CONFIDENCE MEAN BOUNDS: {CONFIDENCE_MEAN_LOW:.1f}-{CONFIDENCE_MEAN_HIGH:.1f}", flush=True)
+    print(f"AI PARTICIPATION HIGH LIMIT: {AI_PARTICIPATION_HIGH:.0%}", flush=True)
     print(f"ALERT COOLDOWN: {ALERT_COOLDOWN_SECONDS}s", flush=True)
     print("SAFETY CHECK: PASS", flush=True)
 
@@ -498,6 +545,67 @@ def run_cycle(cycle):
                 )
 
         _previous_opportunity_count = count
+
+        behaviour = db.get("behaviour") or {}
+        sample_count = safe_int(behaviour.get("sample_count"), 0)
+        long_count = safe_int(behaviour.get("long_count"), 0)
+        short_count = safe_int(behaviour.get("short_count"), 0)
+        avg_conf = safe_float(behaviour.get("avg_final_confidence"))
+        min_conf = safe_float(behaviour.get("min_final_confidence"))
+        max_conf = safe_float(behaviour.get("max_final_confidence"))
+        genuine_ai_count = safe_int(behaviour.get("genuine_ai_count"), 0)
+        signal_sent_count = safe_int(behaviour.get("signal_sent_count"), 0)
+
+        directional_total = long_count + short_count
+        dominant_share = max(long_count, short_count) / directional_total if directional_total else None
+        ai_share = genuine_ai_count / sample_count if sample_count else None
+
+        print(
+            "BEHAVIOUR SNAPSHOT: "
+            f"window={BEHAVIOUR_WINDOW_MINUTES}m | sample={sample_count} | "
+            f"LONG={long_count} | SHORT={short_count} | "
+            f"dominant_share={None if dominant_share is None else round(dominant_share, 3)} | "
+            f"avg_conf={None if avg_conf is None else round(avg_conf, 2)} | "
+            f"min_conf={None if min_conf is None else round(min_conf, 2)} | "
+            f"max_conf={None if max_conf is None else round(max_conf, 2)} | "
+            f"genuine_ai={genuine_ai_count} | "
+            f"ai_share={None if ai_share is None else round(ai_share, 3)} | "
+            f"signals_sent={signal_sent_count}",
+            flush=True,
+        )
+
+        if sample_count < BEHAVIOUR_MIN_SAMPLE:
+            print(
+                f"BEHAVIOUR STATUS: OBSERVE ONLY | sample {sample_count} below minimum {BEHAVIOUR_MIN_SAMPLE}",
+                flush=True,
+            )
+        else:
+            flags = 0
+            if dominant_share is not None and dominant_share >= DIRECTION_IMBALANCE_LIMIT:
+                dominant = "LONG" if long_count >= short_count else "SHORT"
+                add_warning(
+                    warnings, "DIRECTION_EXTREME_IMBALANCE",
+                    f"{dominant} is {dominant_share:.1%} of {directional_total} recent directional opportunities",
+                )
+                flags += 1
+            if avg_conf is not None and (avg_conf < CONFIDENCE_MEAN_LOW or avg_conf > CONFIDENCE_MEAN_HIGH):
+                add_warning(
+                    warnings, "CONFIDENCE_DISTRIBUTION_ABNORMAL",
+                    f"recent mean final confidence {avg_conf:.2f} is outside {CONFIDENCE_MEAN_LOW:.1f}-{CONFIDENCE_MEAN_HIGH:.1f}",
+                )
+                flags += 1
+            # Low AI participation is not a warning because ranked AI is selective.
+            if ai_share is not None and ai_share > AI_PARTICIPATION_HIGH:
+                add_warning(
+                    warnings, "AI_PARTICIPATION_HIGH",
+                    f"genuine AI participation {ai_share:.1%} exceeds {AI_PARTICIPATION_HIGH:.0%} of recent opportunities",
+                )
+                flags += 1
+            print(
+                "BEHAVIOUR STATUS: HEALTHY | broad anomaly bounds not breached"
+                if flags == 0 else f"BEHAVIOUR STATUS: WARNING | flags={flags}",
+                flush=True,
+            )
     else:
         add_warning(warnings, "POSTGRES_UNAVAILABLE", db["message"])
         print(f"POSTGRES: WARNING | {db['message']}", flush=True)
